@@ -5,7 +5,7 @@ ESP32-based environmental monitor using a Sensirion SCD41 CO2/temperature/humidi
 ## Hardware
 
 - ESP32 Dev Module (CP2102)
-- Sensirion SCD41 CO2 Sensor
+- [Sensirion SCD41 CO2 Sensor](https://sensirion.com/products/catalog/SCD41) - see product page for datasheet and programming best practices
 
 ### Wiring
 
