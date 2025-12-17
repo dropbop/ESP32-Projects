@@ -11,6 +11,7 @@ Thumbs.db
 # IDE/Editor
 .vscode/
 .idea/
+.theia/
 *.swp
 *.swo
 
@@ -20,3 +21,6 @@ build/
 *.elf
 *.bin
 *.hex
+
+# Arduino IDE Libraries
+libraries/

@@ -12,7 +12,7 @@ const char* eventEndpoint = "https://www.dropbop.xyz/api/sensor/log";
 const char* deviceName = "office";
 
 // Timing config - adjust as needed
-const unsigned long MEASUREMENT_INTERVAL_MS = 10000;  // 10 seconds for stress testing
+const unsigned long MEASUREMENT_INTERVAL_MS = 60000;  // 60 seconds - matches sensor response time
 const unsigned long WIFI_RETRY_DELAY_MS = 500;
 const int WIFI_MAX_ATTEMPTS = 30;
 
@@ -255,7 +255,7 @@ void setup() {
     
     Serial.println();
     Serial.println("=== ESP32 SCD41 CO2 Sensor + WiFi ===");
-    Serial.println("Stress test mode - 10 second intervals");
+    Serial.println("Single-shot mode - 60 second intervals");
     
     // Connect to WiFi
     connectWiFi();
