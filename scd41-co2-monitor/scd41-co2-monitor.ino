@@ -5,6 +5,7 @@
 #include <Wire.h>
 
 #include "secrets.h"  // WiFi creds and API token
+#include "forced_calibration.h"
 
 // Config (not sensitive - safe to commit)
 const char* endpoint = "https://www.dropbop.xyz/api/sensor";
@@ -311,11 +312,21 @@ void setup() {
     
     // Power down sensor until first measurement
     sensor.powerDown();
-    
+
+    // Initialize forced recalibration module
+    frcInit();
+
     Serial.println();
 }
 
 void loop() {
+    // Check for forced recalibration button press
+    if (frcCheckButton(sensor, [](int type, const char* msg) {
+        return sendEvent((EventType)type, msg);
+    })) {
+        return;  // FRC ran, skip this loop iteration
+    }
+
     uint16_t co2 = 0;
     float temp = 0.0;
     float humidity = 0.0;
@@ -455,9 +466,20 @@ void loop() {
     
     // Calculate remaining wait time
     // measureAndReadSingleShot takes ~5 seconds, so subtract that
-    unsigned long waitTime = MEASUREMENT_INTERVAL_MS > 5000 ? 
+    unsigned long waitTime = MEASUREMENT_INTERVAL_MS > 5000 ?
                              MEASUREMENT_INTERVAL_MS - 5000 : 0;
-    
-    Serial.printf("Waiting %lu ms...\n\n", waitTime);
-    delay(waitTime);
+
+    Serial.printf("Waiting %lu ms (hold BOOT to calibrate)...\n\n", waitTime);
+
+    // Non-blocking wait that checks for FRC button
+    unsigned long waitStart = millis();
+    while (millis() - waitStart < waitTime) {
+        // Check for calibration button during wait
+        if (frcCheckButton(sensor, [](int type, const char* msg) {
+            return sendEvent((EventType)type, msg);
+        })) {
+            return;  // FRC ran, restart loop
+        }
+        delay(100);  // Check every 100ms
+    }
 }
