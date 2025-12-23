@@ -39,6 +39,21 @@ static uint32_t successfulUploads = 0;
 static uint32_t totalI2CErrors = 0;
 static uint32_t totalWiFiReconnects = 0;
 
+// Batch configuration
+const unsigned long BATCH_INTERVAL_MS = 600000;  // 10 minutes
+const int MAX_BUFFER_SIZE = 15;  // 10 normal + margin for send failures
+
+struct Reading {
+    uint16_t co2;
+    float temp;
+    float humidity;
+    char timestamp[25];  // ISO 8601: "2024-12-23T10:00:00Z"
+};
+
+Reading readingBuffer[MAX_BUFFER_SIZE];
+int bufferCount = 0;
+unsigned long lastBatchSentMs = 0;
+
 // Event types
 enum EventType {
     EVENT_INFO,
@@ -175,6 +190,71 @@ bool sendData(uint16_t co2, float temp, float humidity) {
     return success;
 }
 
+void getISOTimestamp(char* buffer, size_t len) {
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo)) {
+        strftime(buffer, len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
+    } else {
+        // Fallback: use uptime-based pseudo-timestamp
+        snprintf(buffer, len, "1970-01-01T00:00:%02luZ", millis() / 1000 % 60);
+    }
+}
+
+bool sendBatch() {
+    if (bufferCount == 0) return true;
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("WiFi not connected, attempting reconnect for batch...");
+        totalWiFiReconnects++;
+        connectWiFi();
+        if (WiFi.status() != WL_CONNECTED) {
+            Serial.println("Still no WiFi, batch deferred.");
+            return false;
+        }
+        sendEvent(EVENT_WARNING, "WiFi reconnected for batch send");
+    }
+
+    // Build JSON: {"device":"office","readings":[{...},{...}]}
+    String payload = "{\"device\":\"" + String(deviceName) + "\",\"readings\":[";
+    for (int i = 0; i < bufferCount; i++) {
+        if (i > 0) payload += ",";
+        payload += "{\"co2\":" + String(readingBuffer[i].co2) +
+                   ",\"temp\":" + String(readingBuffer[i].temp, 1) +
+                   ",\"humidity\":" + String(readingBuffer[i].humidity, 1) +
+                   ",\"ts\":\"" + String(readingBuffer[i].timestamp) + "\"}";
+    }
+    payload += "]}";
+
+    Serial.print("Sending batch: ");
+    Serial.println(payload);
+
+    HTTPClient http;
+    http.begin("https://www.dropbop.xyz/api/sensor/batch");
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("X-Sensor-Token", sensorToken);
+    http.setTimeout(10000);  // 10s timeout for batch
+
+    int httpCode = http.POST(payload);
+    bool success = false;
+
+    if (httpCode == 200) {
+        Serial.printf("Batch sent successfully: %d readings\n", bufferCount);
+        String response = http.getString();
+        Serial.println(response);
+        bufferCount = 0;  // Clear buffer on success
+        success = true;
+    } else {
+        Serial.print("Batch send failed: ");
+        if (httpCode > 0) {
+            Serial.println(httpCode);
+        } else {
+            Serial.println(http.errorToString(httpCode));
+        }
+    }
+
+    http.end();
+    return success;
+}
+
 void printDiagnostics() {
     Serial.println("=== Diagnostics ===");
     Serial.printf("Total measurements: %lu\n", totalMeasurements);
@@ -260,7 +340,19 @@ void setup() {
     
     // Connect to WiFi
     connectWiFi();
-    
+
+    // Sync time via NTP (needed for batch timestamps)
+    configTime(0, 0, "pool.ntp.org");  // UTC - frontend handles timezone display
+    struct tm timeinfo;
+    if (getLocalTime(&timeinfo, 5000)) {
+        Serial.println("NTP time synced");
+    } else {
+        Serial.println("NTP sync failed, timestamps will be approximate");
+    }
+
+    // Start batch timer from now (not from boot)
+    lastBatchSentMs = millis();
+
     // Initialize I2C
     Wire.begin(21, 22);
     sensor.begin(Wire, SCD41_I2C_ADDR_62);
@@ -429,15 +521,37 @@ void loop() {
     // Print locally
     Serial.println("=== Reading ===");
     Serial.printf("CO2: %d ppm | Temp: %.1f C | Humidity: %.1f %%\n", co2, temp, humidity);
-    
-    // Send to server
-    if (sendData(co2, temp, humidity)) {
-        successfulUploads++;
-        consecutiveFailures = 0;
+
+    // Store reading in buffer instead of sending immediately
+    if (bufferCount < MAX_BUFFER_SIZE) {
+        readingBuffer[bufferCount].co2 = co2;
+        readingBuffer[bufferCount].temp = temp;
+        readingBuffer[bufferCount].humidity = humidity;
+        getISOTimestamp(readingBuffer[bufferCount].timestamp, 25);
+        bufferCount++;
+        Serial.printf("Buffered reading %d/%d\n", bufferCount, MAX_BUFFER_SIZE);
     } else {
-        consecutiveFailures++;
+        Serial.println("Buffer full, dropping reading");
     }
-    
+
+    // Check if time to send batch
+    unsigned long now = millis();
+    bool shouldSend = (now - lastBatchSentMs >= BATCH_INTERVAL_MS) ||
+                      (bufferCount >= MAX_BUFFER_SIZE - 2);  // Force if buffer nearly full
+
+    if (shouldSend && bufferCount > 0) {
+        int sentCount = bufferCount;  // Save before sendBatch clears it
+        if (sendBatch()) {
+            successfulUploads += sentCount;
+            lastBatchSentMs = now;
+            consecutiveFailures = 0;
+            flashLED(2);  // Double flash = batch sent
+        } else {
+            consecutiveFailures++;
+            flashLED(3);  // Triple flash = failed
+        }
+    }
+
     // Print diagnostics every 100 measurements
     if (totalMeasurements % 100 == 0) {
         printDiagnostics();
