@@ -1,6 +1,6 @@
 # SCD41 CO2 Monitor
 
-ESP32-based CO2/temperature/humidity monitor. Posts readings to a remote API every 60 seconds. Includes forced recalibration via BOOT button.
+ESP32-based CO2/temperature/humidity monitor. Buffers readings locally and sends batches to a remote API every 10 minutes. Includes forced recalibration via BOOT button.
 
 ## Hardware
 
@@ -41,28 +41,46 @@ Built-in LED on GPIO 2 used for status feedback.
 
 ## Features
 
-**Sensor reading:** Single-shot mode every 60s. Powers down sensor between readings.
+**Sensor reading:** Single-shot mode every 60s. Powers down sensor between readings to save power.
 
-**Error handling:** Tracks consecutive I2C failures, attempts bus recovery after 3 failures. Logs events to server.
+**Batch uploading:** Readings are buffered locally (up to 15) with ISO 8601 timestamps via NTP. Batches are sent every 10 minutes, reducing network traffic and improving reliability. If buffer fills up, batch sends early.
+
+**Error handling:** Tracks consecutive I2C failures, attempts bus recovery after 3 failures. Logs events to server with diagnostics (uptime, heap, measurement counts).
 
 **LED feedback:**
-- 1 flash = successful upload
+- 2 flashes = batch sent successfully
 - 3 flashes = upload failed
 - Slow blink = connecting to WiFi
+
+**Diagnostics:** Prints stats every 100 measurements (success rate, I2C errors, WiFi reconnects). Sends periodic health reports to server.
 
 **Forced Recalibration (FRC):**
 Hold BOOT button for 3 seconds to trigger. Requires 5 min warmup in fresh outdoor air, then calibrates to 440 ppm reference. Configurable in `forced_calibration.h`.
 
 ## API
 
-**Sensor data** (`POST /api/sensor`):
+**Batch sensor data** (`POST /api/sensor/batch`):
 ```json
-{"device": "office", "co2": 850, "temp": 22.1, "humidity": 45.3}
+{
+  "device": "office",
+  "readings": [
+    {"co2": 850, "temp": 22.1, "humidity": 45.3, "ts": "2024-12-23T10:00:00Z"},
+    {"co2": 862, "temp": 22.2, "humidity": 45.1, "ts": "2024-12-23T10:01:00Z"}
+  ]
+}
 ```
 
 **Event logging** (`POST /api/sensor/log`):
 ```json
-{"device": "office", "event_type": "error", "message": "...", "uptime": 3600, "heap": 200000}
+{
+  "device": "office",
+  "event_type": "error",
+  "message": "...",
+  "uptime": 3600,
+  "heap": 200000,
+  "total_measurements": 150,
+  "i2c_errors": 2
+}
 ```
 
-Both require `X-Sensor-Token` header.
+All endpoints require `X-Sensor-Token` header.
