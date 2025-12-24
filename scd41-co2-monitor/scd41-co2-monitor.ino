@@ -40,6 +40,9 @@ static uint32_t totalI2CErrors = 0;
 static uint32_t totalWiFiReconnects = 0;
 
 // Batch configuration
+// TODO: May need to increase interval if Neon compute usage still too high
+// Napkin math: 32 batches/day = ~100 CU hours in 31 days (just under free tier)
+// That would mean 45-minute intervals (2700000 ms)
 const unsigned long BATCH_INTERVAL_MS = 600000;  // 10 minutes
 const int MAX_BUFFER_SIZE = 15;  // 10 normal + margin for send failures
 
