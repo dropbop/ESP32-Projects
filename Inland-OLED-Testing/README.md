@@ -5,7 +5,7 @@ Test suite for the Inland 1.3" 128x64 OLED display (SH1106 driver).
 ## Hardware
 
 - ESP32 Dev Module
-- [Inland IIC/SPI 1.3" 128x64 OLED V2.0](https://www.microcenter.com/product/643965/inland-iic-spi-13-128x64-oled-v20-graphic-display-module-for-arduino-uno-r3) (Micro Center #643965)
+- [Inland IIC/SPI 1.3" 128x64 OLED V2.0](https://www.microcenter.com/product/643965/inland-iic-spi-13-128x64-oled-v20-graphic-display-module-for-arduino-uno-r3) (SKU: 345785, Mfr Part#: KS0056)
 
 **Note:** This display uses the SH1106 driver, not SSD1306. Requires 5V on VCC (3.3V may not work).
 
