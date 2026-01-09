@@ -6,7 +6,7 @@ ESP32-based CO2/temperature/humidity monitor with local OLED display. Buffers re
 
 - ESP32 Dev Module (CP2102 or similar)
 - [Sensirion SCD41](https://sensirion.com/products/catalog/SCD41) CO2 sensor
-- [Inland 1.3" 128x64 OLED](https://www.microcenter.com/product/643965) (SH1106 driver)
+- [Inland 1.3" 128x64 OLED](https://www.microcenter.com/product/643965/inland-iic-spi-13-128x64-oled-v20-graphic-display-module-for-arduino-uno-r3) (SH1106 driver, SKU: 345785, Mfr Part#: KS0056)
 
 ### Wiring
 
