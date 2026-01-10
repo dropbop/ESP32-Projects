@@ -7,6 +7,7 @@ ESP32-based CO2/temperature/humidity monitor with local OLED display. Buffers re
 - ESP32 Dev Module (CP2102 or similar)
 - [Sensirion SCD41](https://sensirion.com/products/catalog/SCD41) CO2 sensor
 - [Inland 1.3" 128x64 OLED](https://www.microcenter.com/product/643965/inland-iic-spi-13-128x64-oled-v20-graphic-display-module-for-arduino-uno-r3) (SH1106 driver, SKU: 345785, Mfr Part#: KS0056)
+- IR LED + 100 ohm resistor (for Whynter AC control)
 
 ### Wiring
 
@@ -29,6 +30,12 @@ ESP32-based CO2/temperature/humidity monitor with local OLED display. Buffers re
 | DC | GPIO 14 |
 | CS | GPIO 27 |
 
+**IR LED:**
+| IR LED | ESP32 |
+|--------|-------|
+| Anode (long leg) | 100 ohm resistor -> GPIO 4 |
+| Cathode (short leg) | GND |
+
 Built-in LED on GPIO 2 used for status feedback.
 
 ## Setup
@@ -37,6 +44,7 @@ Built-in LED on GPIO 2 used for status feedback.
 2. Install libraries (Library Manager):
    - **Sensirion I2C SCD4x**
    - **U8g2**
+   - **IRremoteESP8266**
 3. Copy `secrets.h.example` to `secrets.h` and fill in:
    ```cpp
    const char* ssid = "your_wifi";
@@ -85,6 +93,7 @@ Built-in LED on GPIO 2 used for status feedback.
 | `scd41-co2-monitor-oled.ino` | Main code with OLED integration |
 | `secrets.h` | WiFi creds and API token (gitignored) |
 | `forced_calibration.h` | FRC module triggered by BOOT button |
+| `whynter_ir.h` | IR blaster for Whynter AC (vestigial) |
 
 ## Notes
 

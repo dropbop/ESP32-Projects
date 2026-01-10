@@ -1,15 +1,16 @@
 /*
  * SCD41 CO2 Monitor with OLED Display
- * 
+ *
  * Hardware:
  *   - ESP32 Dev Module
  *   - Sensirion SCD41 CO2 sensor (I2C)
  *   - Inland 1.3" 128x64 OLED (SH1106, SPI)
- * 
+ *   - IR LED (for Whynter AC control)
+ *
  * Wiring:
- *   SCD41 (I2C):           OLED (SPI):
- *   VDD  -> 3V3            VCC  -> VIN (5V)
- *   GND  -> GND            GND  -> GND
+ *   SCD41 (I2C):           OLED (SPI):              IR LED:
+ *   VDD  -> 3V3            VCC  -> VIN (5V)         Anode  -> 100ohm -> GPIO 4
+ *   GND  -> GND            GND  -> GND              Cathode -> GND
  *   SDA  -> GPIO 21        CLK  -> GPIO 25
  *   SCL  -> GPIO 22        MOSI -> GPIO 26
  *                          RES  -> GPIO 12
@@ -26,6 +27,7 @@
 
 #include "secrets.h"
 #include "forced_calibration.h"
+#include "whynter_ir.h"
 
 // =========================
 // OLED PIN DEFINITIONS
@@ -427,7 +429,10 @@ void setup() {
     Serial.println("\n================================");
     Serial.println("SCD41 CO2 Monitor + OLED");
     Serial.println("================================");
-    
+
+    // Initialize IR sender (vestigial - not actively used yet)
+    irInit();
+
     // Connect WiFi
     displayMessage("Connecting WiFi...");
     connectWiFi();
