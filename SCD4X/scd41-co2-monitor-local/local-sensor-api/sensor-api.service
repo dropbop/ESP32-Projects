@@ -1,0 +1,15 @@
+[Unit]
+Description=Local Sensor API
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=dropbop
+WorkingDirectory=/home/dropbop/code/ESP32-Projects/SCD4X/scd41-co2-monitor-local/local-sensor-api
+ExecStart=/home/dropbop/code/ESP32-Projects/SCD4X/scd41-co2-monitor-local/local-sensor-api/venv/bin/python sensor_api.py
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
