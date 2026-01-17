@@ -28,7 +28,7 @@ Simplified ESP32 sensor firmware that sends data to a local Flask API over plain
 const char* ssid = "YOUR_WIFI_SSID";
 const char* password = "YOUR_WIFI_PASSWORD";
 const char* deviceName = "office";  // Change for each sensor
-const char* apiEndpoint = "http://100.77.157.78:5000";  // ThinkPad IP
+const char* apiEndpoint = "http://192.168.1.100:5001";  // Your server IP
 ```
 
 ## Required Libraries
@@ -38,20 +38,23 @@ Install via Arduino Library Manager:
 
 ## Behavior
 
-- Takes a reading every 60 seconds
-- Buffers up to 15 readings
-- Uploads batch every 10 minutes (or when buffer is nearly full)
-- Sends events/errors to `/api/sensor/log`
-- Blue LED flashes: 2x on successful upload, 3x on failure
+- Takes a reading every 30 seconds
+- Sends each reading immediately to the API
+- Auto-reconnects WiFi if disconnected
+- I2C bus recovery after 3 consecutive sensor errors
+- Blue LED: 1 flash on success, 3 flashes on failure
 
-## Endpoints Called
+## API Endpoint
 
-- `POST /api/sensor/batch` - Batched readings
-- `POST /api/sensor/log` - Events/errors
+`POST /api/sensor`
+
+```json
+{"device":"office","co2":650,"temp":18.1,"humidity":62.5}
+```
 
 ## Multi-Sensor Setup
 
-Deploy multiple sensors by flashing the same firmware with different `deviceName` values:
+Deploy multiple sensors by flashing with different `deviceName` values:
 - `"office"`
 - `"bedroom"`
 - `"garage"`

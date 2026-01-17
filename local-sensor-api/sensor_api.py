@@ -35,6 +35,42 @@ def health():
         return jsonify({'status': 'error', 'database': str(e)}), 500
 
 
+@app.route('/api/sensor', methods=['POST'])
+def receive_single():
+    """
+    Receive single sensor reading.
+
+    Expected JSON:
+    {"device": "office", "co2": 800, "temp": 22.0, "humidity": 45.0}
+    """
+    data = request.get_json()
+
+    if not data:
+        return jsonify({'error': 'No JSON data'}), 400
+
+    device = data.get('device')
+    if not device:
+        return jsonify({'error': 'Missing device name'}), 400
+
+    try:
+        with get_db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO readings (device, co2, temp, humidity)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    (device, data.get('co2'), data.get('temp'), data.get('humidity'))
+                )
+
+        print(f"[SINGLE] {device}: co2={data.get('co2')} temp={data.get('temp')} humidity={data.get('humidity')}")
+        return jsonify({'status': 'ok'})
+
+    except Exception as e:
+        print(f"[ERROR] Single insert failed: {e}")
+        return jsonify({'error': str(e)}), 500
+
+
 @app.route('/api/sensor/batch', methods=['POST'])
 def receive_batch():
     """
