@@ -28,6 +28,18 @@
 #include <esp_task_wdt.h>
 
 #include "secrets.h"
+
+// Event types (must be defined before forced_calibration.h)
+enum EventType {
+    EVENT_INFO = 0,
+    EVENT_WARNING = 1,
+    EVENT_ERROR = 2,
+    EVENT_CRITICAL = 3
+};
+
+// Forward declaration for forced_calibration.h callback
+bool sendEvent(EventType type, const char* message);
+
 #include "forced_calibration.h"
 
 // ===========================================
@@ -94,13 +106,6 @@ void flashLED(int times, int duration = 100) {
 // ===========================================
 // Event logging
 // ===========================================
-
-enum EventType {
-    EVENT_INFO,
-    EVENT_WARNING,
-    EVENT_ERROR,
-    EVENT_CRITICAL
-};
 
 bool sendEvent(EventType type, const char* message) {
     if (WiFi.status() != WL_CONNECTED) {
@@ -328,8 +333,14 @@ void setup() {
     }
     delay(100);
     
-    // Initialize watchdog
-    esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+    // Initialize watchdog (ESP-IDF v5.x API)
+    esp_task_wdt_config_t wdt_config = {
+        .timeout_ms = WATCHDOG_TIMEOUT_SECONDS * 1000,
+        .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
+        .trigger_panic = true
+    };
+    esp_task_wdt_deinit();  // WDT may already be initialized
+    esp_task_wdt_init(&wdt_config);
     esp_task_wdt_add(NULL);
     
     pinMode(LED_PIN, OUTPUT);
@@ -361,7 +372,7 @@ void setup() {
     int16_t error;
     
     // Set altitude for pressure compensation
-    error = sensor.setAltitude(SENSOR_ALTITUDE_METERS);
+    error = sensor.setSensorAltitude(SENSOR_ALTITUDE_METERS);
     if (error != 0) {
         Serial.print("setAltitude error: ");
         Serial.println(error);
@@ -371,11 +382,8 @@ void setup() {
         Serial.println(" m");
     }
     
-    // Set temperature offset
-    // The Sensirion library expects offset in ticks, not degrees
-    // Conversion: ticks = offset_celsius * 65535 / 175
-    uint16_t offsetTicks = (uint16_t)(TEMPERATURE_OFFSET_C * 65535.0 / 175.0);
-    error = sensor.setTemperatureOffset(offsetTicks);
+    // Set temperature offset (library takes degrees directly)
+    error = sensor.setTemperatureOffset(TEMPERATURE_OFFSET_C);
     if (error != 0) {
         Serial.print("setTemperatureOffset error: ");
         Serial.println(error);
@@ -406,15 +414,19 @@ void setup() {
     }
     
     // Start periodic measurement mode
-    // Sensor updates every 5 seconds internally, ASC runs automatically
+    // Sensor updates every 5 seconds internally
     error = sensor.startPeriodicMeasurement();
     if (error != 0) {
         Serial.print("startPeriodicMeasurement error: ");
         Serial.println(error);
         sendEvent(EVENT_CRITICAL, "Failed to start periodic measurement");
     } else {
-        Serial.println("Periodic measurement started (ASC enabled)");
+        Serial.println("Periodic measurement started");
     }
+
+    // Disable ASC - relying on manual FRC calibration instead
+    sensor.setAutomaticSelfCalibrationEnabled(false);
+    Serial.println("ASC disabled (using manual FRC calibration)");
     
     // Initialize FRC module
     frcInit();
