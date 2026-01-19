@@ -37,7 +37,7 @@ Built-in LED on GPIO 2 provides status feedback.
    ```cpp
    const char* ssid = "your_wifi";
    const char* password = "your_password";
-   const char* apiEndpoint = "http://192.168.1.xxx:5000";
+   const char* apiEndpoint = "http://192.168.1.xxx:5001";
    const char* deviceName = "office";
    ```
 4. Adjust configuration in main `.ino` if needed:
@@ -49,7 +49,7 @@ Built-in LED on GPIO 2 provides status feedback.
 
 | File | Purpose |
 |------|---------|
-| `scd41-co2-monitor.ino` | Main code |
+| `scd41-co2-monitor-v2.ino` | Main code |
 | `secrets.h` | WiFi and API config (gitignored) |
 | `secrets.h.example` | Template for secrets.h |
 | `forced_calibration.h` | Manual calibration module |
