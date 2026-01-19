@@ -1,69 +1,86 @@
+/*
+ * SCD41 CO2 Monitor - Local API Version
+ * 
+ * Sends readings every 60 seconds to a local Flask API.
+ * Uses periodic measurement mode with ASC (automatic self-calibration) enabled.
+ * 
+ * Hardware:
+ *   - ESP32 Dev Module
+ *   - Sensirion SCD41 CO2 sensor (I2C)
+ * 
+ * Wiring:
+ *   SCD41 SDA  -> GPIO 21
+ *   SCD41 SCL  -> GPIO 22
+ *   SCD41 VDD  -> 3V3
+ *   SCD41 GND  -> GND
+ * 
+ * Calibration:
+ *   ASC is enabled and handles long-term drift automatically, provided the
+ *   sensor sees fresh outdoor air (~420-440 ppm) for at least 3 minutes
+ *   once per week. For manual calibration, hold BOOT button for 3 seconds.
+ */
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <SensirionI2cScd4x.h>
 #include <Wire.h>
+#include <esp_task_wdt.h>
 
-#include "secrets.h"  // WiFi creds and API token
+#include "secrets.h"
 #include "forced_calibration.h"
 
-// Config (not sensitive - safe to commit)
-const char* endpoint = "https://www.dropbop.xyz/api/sensor";
-const char* eventEndpoint = "https://www.dropbop.xyz/api/sensor/log";
-const char* deviceName = "office";
+// ===========================================
+// Configuration
+// ===========================================
 
-// Timing config - adjust as needed
-const unsigned long MEASUREMENT_INTERVAL_MS = 60000;  // 60 seconds - matches sensor response time
+// Measurement interval (sensor updates internally every 5s, we read every 60s)
+const unsigned long MEASUREMENT_INTERVAL_MS = 60000;
+
+// Altitude compensation - Houston, TX is ~15m above sea level
+// Adjust if you move the sensor to a different elevation
+const uint16_t SENSOR_ALTITUDE_METERS = 15;
+
+// Temperature offset compensation for self-heating
+// Default is 4.0°C - calibrate against a reference thermometer and adjust
+// Formula: offset = T_sensor - T_reference + current_offset
+const float TEMPERATURE_OFFSET_C = 4.0;
+
+// WiFi connection
 const unsigned long WIFI_RETRY_DELAY_MS = 500;
 const int WIFI_MAX_ATTEMPTS = 30;
 
-// LED for status
-#define LED_PIN 2
+// Watchdog timeout - resets ESP32 if loop hangs
+const int WATCHDOG_TIMEOUT_SECONDS = 120;
 
-// Sensor
+// ===========================================
+// Hardware
+// ===========================================
+
+#define LED_PIN 2
+#define I2C_SDA 21
+#define I2C_SCL 22
+
+// ===========================================
+// Global state
+// ===========================================
+
 SensirionI2cScd4x sensor;
 
-#ifdef NO_ERROR
-#undef NO_ERROR
-#endif
-#define NO_ERROR 0
-
-static char errorMessage[64];
-static int16_t error;
-
-// Track consecutive failures for diagnostics
-static uint32_t consecutiveFailures = 0;
-static uint32_t consecutiveI2CFailures = 0;
+// Stats
 static uint32_t totalMeasurements = 0;
 static uint32_t successfulUploads = 0;
 static uint32_t totalI2CErrors = 0;
 static uint32_t totalWiFiReconnects = 0;
+static uint32_t consecutiveI2CFailures = 0;
+static uint32_t consecutiveUploadFailures = 0;
 
-// Batch configuration
-// TODO: May need to increase interval if Neon compute usage still too high
-// Napkin math: 32 batches/day = ~100 CU hours in 31 days (just under free tier)
-// That would mean 45-minute intervals (2700000 ms)
-const unsigned long BATCH_INTERVAL_MS = 600000;  // 10 minutes
-const int MAX_BUFFER_SIZE = 15;  // 10 normal + margin for send failures
+// Timing
+static unsigned long lastMeasurementTime = 0;
 
-struct Reading {
-    uint16_t co2;
-    float temp;
-    float humidity;
-    char timestamp[25];  // ISO 8601: "2024-12-23T10:00:00Z"
-};
-
-Reading readingBuffer[MAX_BUFFER_SIZE];
-int bufferCount = 0;
-unsigned long lastBatchSentMs = 0;
-
-// Event types
-enum EventType {
-    EVENT_INFO,
-    EVENT_WARNING,
-    EVENT_ERROR,
-    EVENT_CRITICAL
-};
+// ===========================================
+// LED feedback
+// ===========================================
 
 void flashLED(int times, int duration = 100) {
     for (int i = 0; i < times; i++) {
@@ -74,10 +91,21 @@ void flashLED(int times, int duration = 100) {
     }
 }
 
-// Send event/error to server for logging
+// ===========================================
+// Event logging
+// ===========================================
+
+enum EventType {
+    EVENT_INFO,
+    EVENT_WARNING,
+    EVENT_ERROR,
+    EVENT_CRITICAL
+};
+
 bool sendEvent(EventType type, const char* message) {
     if (WiFi.status() != WL_CONNECTED) {
-        Serial.printf("[EVENT NOT SENT - NO WIFI] %s\n", message);
+        Serial.print("[Event not sent - no WiFi] ");
+        Serial.println(message);
         return false;
     }
     
@@ -91,10 +119,10 @@ bool sendEvent(EventType type, const char* message) {
     }
     
     HTTPClient http;
-    http.begin(eventEndpoint);
+    String url = String(apiEndpoint) + "/api/sensor/log";
+    http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Sensor-Token", sensorToken);
-    http.setTimeout(5000);  // 5 second timeout for event logging
+    http.setTimeout(5000);
     
     String payload = "{\"device\":\"" + String(deviceName) + 
                      "\",\"event_type\":\"" + String(typeStr) + 
@@ -104,14 +132,20 @@ bool sendEvent(EventType type, const char* message) {
                      ",\"total_measurements\":" + String(totalMeasurements) +
                      ",\"i2c_errors\":" + String(totalI2CErrors) + "}";
     
-    Serial.print("[EVENT] Sending: ");
-    Serial.println(payload);
-    
     int httpCode = http.POST(payload);
     http.end();
     
     return httpCode == 200;
 }
+
+// Wrapper for FRC module callback
+bool frcEventCallback(int type, const char* msg) {
+    return sendEvent((EventType)type, msg);
+}
+
+// ===========================================
+// WiFi
+// ===========================================
 
 void connectWiFi() {
     Serial.print("Connecting to WiFi");
@@ -121,7 +155,6 @@ void connectWiFi() {
     while (WiFi.status() != WL_CONNECTED && attempts < WIFI_MAX_ATTEMPTS) {
         delay(WIFI_RETRY_DELAY_MS);
         Serial.print(".");
-        // Slow blink while connecting
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
         attempts++;
     }
@@ -134,469 +167,394 @@ void connectWiFi() {
     } else {
         Serial.println();
         Serial.println("WiFi connection failed!");
-        // Rapid blink for WiFi failure
-        for (int i = 0; i < 10; i++) {
-            flashLED(1, 50);
-            delay(50);
-        }
+        flashLED(10, 50);
     }
 }
 
-bool sendData(uint16_t co2, float temp, float humidity) {
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected, attempting reconnect...");
-        totalWiFiReconnects++;
-        connectWiFi();
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Still no WiFi, skipping upload.");
-            flashLED(3);  // Triple flash = failed
-            return false;
-        }
-        // Log successful reconnection
+bool ensureWiFi() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return true;
+    }
+    
+    Serial.println("WiFi disconnected, reconnecting...");
+    totalWiFiReconnects++;
+    connectWiFi();
+    
+    if (WiFi.status() == WL_CONNECTED) {
         sendEvent(EVENT_WARNING, "WiFi reconnected after disconnect");
+        return true;
+    }
+    return false;
+}
+
+// ===========================================
+// Sensor data upload
+// ===========================================
+
+bool sendReading(uint16_t co2, float temp, float humidity) {
+    if (!ensureWiFi()) {
+        return false;
     }
     
     HTTPClient http;
-    http.begin(endpoint);
+    String url = String(apiEndpoint) + "/api/sensor";
+    http.begin(url);
     http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Sensor-Token", sensorToken);
+    http.setTimeout(10000);
     
-    String payload = "{\"device\":\"" + String(deviceName) + 
-                     "\",\"co2\":" + String(co2) + 
-                     ",\"temp\":" + String(temp, 1) + 
-                     ",\"humidity\":" + String(humidity, 1) + "}";
+    String payload = "{\"device\":\"" + String(deviceName) +
+                     "\",\"co2\":" + String(co2) +
+                     ",\"temp\":" + String(temp, 1) +
+                     ",\"humidity\":" + String(humidity, 1) +
+                     ",\"rssi\":" + String(WiFi.RSSI()) +
+                     ",\"uptime\":" + String(millis() / 1000) +
+                     ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
     
-    Serial.print("Sending: ");
-    Serial.println(payload);
+    Serial.print("POST ");
+    Serial.print(url);
+    Serial.print(" -> ");
     
     int httpCode = http.POST(payload);
-    bool success = false;
+    http.end();
     
     if (httpCode == 200) {
-        Serial.print("HTTP Response: ");
-        Serial.println(httpCode);
-        String response = http.getString();
-        Serial.println(response);
-        flashLED(1);  // Single flash = success
-        success = true;
+        Serial.println("OK");
+        return true;
     } else {
-        Serial.print("HTTP Error: ");
-        if (httpCode > 0) {
-            Serial.println(httpCode);
-        } else {
-            Serial.println(http.errorToString(httpCode));
-        }
-        flashLED(3);  // Triple flash = failed
-    }
-    
-    http.end();
-    return success;
-}
-
-void getISOTimestamp(char* buffer, size_t len) {
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        strftime(buffer, len, "%Y-%m-%dT%H:%M:%SZ", &timeinfo);
-    } else {
-        // Fallback: use uptime-based pseudo-timestamp
-        snprintf(buffer, len, "1970-01-01T00:00:%02luZ", millis() / 1000 % 60);
+        Serial.print("Failed (");
+        Serial.print(httpCode);
+        Serial.println(")");
+        return false;
     }
 }
 
-bool sendBatch() {
-    if (bufferCount == 0) return true;
-    if (WiFi.status() != WL_CONNECTED) {
-        Serial.println("WiFi not connected, attempting reconnect for batch...");
-        totalWiFiReconnects++;
-        connectWiFi();
-        if (WiFi.status() != WL_CONNECTED) {
-            Serial.println("Still no WiFi, batch deferred.");
-            return false;
-        }
-        sendEvent(EVENT_WARNING, "WiFi reconnected for batch send");
-    }
+// ===========================================
+// I2C recovery
+// ===========================================
 
-    // Build JSON: {"device":"office","readings":[{...},{...}]}
-    String payload = "{\"device\":\"" + String(deviceName) + "\",\"readings\":[";
-    for (int i = 0; i < bufferCount; i++) {
-        if (i > 0) payload += ",";
-        payload += "{\"co2\":" + String(readingBuffer[i].co2) +
-                   ",\"temp\":" + String(readingBuffer[i].temp, 1) +
-                   ",\"humidity\":" + String(readingBuffer[i].humidity, 1) +
-                   ",\"ts\":\"" + String(readingBuffer[i].timestamp) + "\"}";
-    }
-    payload += "]}";
-
-    Serial.print("Sending batch: ");
-    Serial.println(payload);
-
-    HTTPClient http;
-    http.begin("https://www.dropbop.xyz/api/sensor/batch");
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("X-Sensor-Token", sensorToken);
-    http.setTimeout(10000);  // 10s timeout for batch
-
-    int httpCode = http.POST(payload);
-    bool success = false;
-
-    if (httpCode == 200) {
-        Serial.printf("Batch sent successfully: %d readings\n", bufferCount);
-        String response = http.getString();
-        Serial.println(response);
-        bufferCount = 0;  // Clear buffer on success
-        success = true;
-    } else {
-        Serial.print("Batch send failed: ");
-        if (httpCode > 0) {
-            Serial.println(httpCode);
-        } else {
-            Serial.println(http.errorToString(httpCode));
-        }
-    }
-
-    http.end();
-    return success;
-}
-
-void printDiagnostics() {
-    Serial.println("=== Diagnostics ===");
-    Serial.printf("Total measurements: %lu\n", totalMeasurements);
-    Serial.printf("Successful uploads: %lu\n", successfulUploads);
-    Serial.printf("Success rate: %.1f%%\n", 
-        totalMeasurements > 0 ? (100.0 * successfulUploads / totalMeasurements) : 0.0);
-    Serial.printf("Consecutive failures: %lu\n", consecutiveFailures);
-    Serial.printf("Total I2C errors: %lu\n", totalI2CErrors);
-    Serial.printf("WiFi reconnects: %lu\n", totalWiFiReconnects);
-    Serial.printf("Free heap: %lu bytes\n", ESP.getFreeHeap());
-    Serial.printf("Uptime: %lu seconds\n", millis() / 1000);
-    Serial.println("==================");
-}
-
-// Attempt to recover I2C bus and sensor
 bool recoverI2C() {
     Serial.println("Attempting I2C recovery...");
     
-    // Toggle I2C pins to try to reset the bus
+    // End I2C
     Wire.end();
     delay(100);
     
     // Manually clock out any stuck transaction
-    pinMode(21, OUTPUT);  // SDA
-    pinMode(22, OUTPUT);  // SCL
+    pinMode(I2C_SDA, OUTPUT);
+    pinMode(I2C_SCL, OUTPUT);
     
-    digitalWrite(21, HIGH);
+    // 9 clock pulses to release stuck slave
+    digitalWrite(I2C_SDA, HIGH);
     for (int i = 0; i < 9; i++) {
-        digitalWrite(22, HIGH);
+        digitalWrite(I2C_SCL, HIGH);
         delayMicroseconds(5);
-        digitalWrite(22, LOW);
+        digitalWrite(I2C_SCL, LOW);
         delayMicroseconds(5);
     }
     
     // Generate STOP condition
-    digitalWrite(21, LOW);
+    digitalWrite(I2C_SDA, LOW);
     delayMicroseconds(5);
-    digitalWrite(22, HIGH);
+    digitalWrite(I2C_SCL, HIGH);
     delayMicroseconds(5);
-    digitalWrite(21, HIGH);
+    digitalWrite(I2C_SDA, HIGH);
     
     delay(100);
     
-    // Reinitialize I2C
-    Wire.begin(21, 22);
+    // Reinitialize
+    Wire.begin(I2C_SDA, I2C_SCL);
     sensor.begin(Wire, SCD41_I2C_ADDR_62);
-    
     delay(50);
     
-    // Try to wake up and verify sensor
-    error = sensor.wakeUp();
-    if (error != NO_ERROR) {
-        return false;
-    }
-    
-    delay(30);
-    
-    // Verify by getting serial number
+    // Verify sensor responds
     uint64_t serialNumber = 0;
-    error = sensor.getSerialNumber(serialNumber);
-    if (error != NO_ERROR) {
-        return false;
+    int16_t error = sensor.getSerialNumber(serialNumber);
+    
+    if (error == 0) {
+        Serial.println("I2C recovery successful");
+        
+        // Restart periodic measurement
+        sensor.stopPeriodicMeasurement();
+        delay(500);
+        sensor.startPeriodicMeasurement();
+        
+        return true;
     }
     
-    Serial.println("I2C recovery successful!");
-    return true;
+    Serial.println("I2C recovery failed");
+    return false;
 }
+
+// ===========================================
+// Diagnostics
+// ===========================================
+
+void printDiagnostics() {
+    Serial.println();
+    Serial.println("=== Diagnostics ===");
+    Serial.print("Measurements: ");
+    Serial.println(totalMeasurements);
+    Serial.print("Uploads: ");
+    Serial.print(successfulUploads);
+    Serial.print(" (");
+    if (totalMeasurements > 0) {
+        Serial.print(100.0 * successfulUploads / totalMeasurements, 1);
+    } else {
+        Serial.print("0.0");
+    }
+    Serial.println("%)");
+    Serial.print("I2C errors: ");
+    Serial.println(totalI2CErrors);
+    Serial.print("WiFi reconnects: ");
+    Serial.println(totalWiFiReconnects);
+    Serial.print("Free heap: ");
+    Serial.print(ESP.getFreeHeap());
+    Serial.println(" bytes");
+    Serial.print("Uptime: ");
+    Serial.print(millis() / 1000);
+    Serial.println(" seconds");
+    Serial.println("===================");
+    Serial.println();
+}
+
+// ===========================================
+// Setup
+// ===========================================
 
 void setup() {
     Serial.begin(115200);
+    while (!Serial) {
+        delay(10);
+    }
+    delay(100);
     
-    // Init LED
+    // Initialize watchdog
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_SECONDS, true);
+    esp_task_wdt_add(NULL);
+    
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
     
-    while (!Serial) {
-        delay(100);
-    }
-    
     Serial.println();
-    Serial.println("=== ESP32 SCD41 CO2 Sensor + WiFi ===");
-    Serial.println("Single-shot mode - 60 second intervals");
+    Serial.println("================================");
+    Serial.print("SCD41 CO2 Monitor - ");
+    Serial.println(deviceName);
+    Serial.print("Endpoint: ");
+    Serial.println(apiEndpoint);
+    Serial.println("Mode: Periodic (ASC enabled)");
+    Serial.println("================================");
+    Serial.println();
     
     // Connect to WiFi
     connectWiFi();
-
-    // Sync time via NTP (needed for batch timestamps)
-    configTime(0, 0, "pool.ntp.org");  // UTC - frontend handles timezone display
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo, 5000)) {
-        Serial.println("NTP time synced");
-    } else {
-        Serial.println("NTP sync failed, timestamps will be approximate");
-    }
-
-    // Start batch timer from now (not from boot)
-    lastBatchSentMs = millis();
-
-    // Initialize I2C
-    Wire.begin(21, 22);
+    
+    // Initialize I2C and sensor
+    Wire.begin(I2C_SDA, I2C_SCL);
     sensor.begin(Wire, SCD41_I2C_ADDR_62);
+    delay(30);
     
-    delay(30);  // Wait for sensor power-up (datasheet: max 30ms)
+    // Stop any running measurement
+    sensor.stopPeriodicMeasurement();
+    delay(500);
     
-    // Initialize sensor
-    error = sensor.wakeUp();
-    if (error != NO_ERROR) {
-        Serial.print("wakeUp error: ");
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.println(errorMessage);
+    // Configure sensor
+    int16_t error;
+    
+    // Set altitude for pressure compensation
+    error = sensor.setAltitude(SENSOR_ALTITUDE_METERS);
+    if (error != 0) {
+        Serial.print("setAltitude error: ");
+        Serial.println(error);
+    } else {
+        Serial.print("Altitude set: ");
+        Serial.print(SENSOR_ALTITUDE_METERS);
+        Serial.println(" m");
     }
     
-    error = sensor.stopPeriodicMeasurement();
-    if (error != NO_ERROR) {
-        Serial.print("stopPeriodicMeasurement error: ");
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.println(errorMessage);
+    // Set temperature offset
+    // The Sensirion library expects offset in ticks, not degrees
+    // Conversion: ticks = offset_celsius * 65535 / 175
+    uint16_t offsetTicks = (uint16_t)(TEMPERATURE_OFFSET_C * 65535.0 / 175.0);
+    error = sensor.setTemperatureOffset(offsetTicks);
+    if (error != 0) {
+        Serial.print("setTemperatureOffset error: ");
+        Serial.println(error);
+    } else {
+        Serial.print("Temperature offset set: ");
+        Serial.print(TEMPERATURE_OFFSET_C, 1);
+        Serial.println(" C");
     }
     
-    error = sensor.reinit();
-    if (error != NO_ERROR) {
-        Serial.print("reinit error: ");
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.println(errorMessage);
-    }
-    
+    // Verify sensor and get serial number
     uint64_t serialNumber = 0;
     error = sensor.getSerialNumber(serialNumber);
-    if (error != NO_ERROR) {
-        Serial.print("getSerialNumber error: ");
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.println(errorMessage);
-        Serial.println("SCD41 not found! Check wiring.");
+    if (error != 0) {
+        Serial.println("ERROR: SCD41 not found! Check wiring.");
         sendEvent(EVENT_CRITICAL, "SCD41 sensor not found at startup");
     } else {
         Serial.print("SCD41 serial: 0x");
         Serial.print((uint32_t)(serialNumber >> 32), HEX);
         Serial.println((uint32_t)(serialNumber & 0xFFFFFFFF), HEX);
-        Serial.println("Sensor ready!");
         
-        // Log successful startup
-        char startupMsg[64];
-        snprintf(startupMsg, sizeof(startupMsg), "Sensor started, serial: %08X%08X", 
-                 (uint32_t)(serialNumber >> 32), (uint32_t)(serialNumber & 0xFFFFFFFF));
+        char startupMsg[80];
+        snprintf(startupMsg, sizeof(startupMsg), 
+                 "Sensor started, serial: %08X%08X, altitude: %dm",
+                 (uint32_t)(serialNumber >> 32), 
+                 (uint32_t)(serialNumber & 0xFFFFFFFF),
+                 SENSOR_ALTITUDE_METERS);
         sendEvent(EVENT_INFO, startupMsg);
     }
     
-    // Power down sensor until first measurement
-    sensor.powerDown();
-
-    // Initialize forced recalibration module
+    // Start periodic measurement mode
+    // Sensor updates every 5 seconds internally, ASC runs automatically
+    error = sensor.startPeriodicMeasurement();
+    if (error != 0) {
+        Serial.print("startPeriodicMeasurement error: ");
+        Serial.println(error);
+        sendEvent(EVENT_CRITICAL, "Failed to start periodic measurement");
+    } else {
+        Serial.println("Periodic measurement started (ASC enabled)");
+    }
+    
+    // Initialize FRC module
     frcInit();
-
+    
+    // Set initial timing
+    lastMeasurementTime = millis();
+    
+    Serial.println();
+    Serial.println("Ready. First reading in 60 seconds.");
+    Serial.println("Hold BOOT button 3 seconds to force calibration.");
     Serial.println();
 }
 
-void loop() {
-    // Check for forced recalibration button press
-    if (frcCheckButton(sensor, [](int type, const char* msg) {
-        return sendEvent((EventType)type, msg);
-    })) {
-        return;  // FRC ran, skip this loop iteration
-    }
+// ===========================================
+// Main loop
+// ===========================================
 
+void loop() {
+    // Reset watchdog
+    esp_task_wdt_reset();
+    
+    // Check for FRC button press
+    if (frcCheckButton(sensor, frcEventCallback)) {
+        // FRC was performed, restart periodic measurement
+        sensor.startPeriodicMeasurement();
+        lastMeasurementTime = millis();
+        return;
+    }
+    
+    // Check if it's time for a measurement
+    unsigned long now = millis();
+    if (now - lastMeasurementTime < MEASUREMENT_INTERVAL_MS) {
+        delay(100);
+        return;
+    }
+    lastMeasurementTime = now;
+    
+    // Read measurement
     uint16_t co2 = 0;
     float temp = 0.0;
     float humidity = 0.0;
     
-    // Wake sensor from sleep (datasheet: 30ms max)
-    error = sensor.wakeUp();
-    if (error != NO_ERROR) {
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.print("wakeUp error: ");
-        Serial.println(errorMessage);
-        
+    bool dataReady = false;
+    int16_t error = sensor.getDataReadyStatus(dataReady);
+    
+    if (error != 0) {
+        Serial.print("getDataReadyStatus error: ");
+        Serial.println(error);
         totalI2CErrors++;
         consecutiveI2CFailures++;
-        consecutiveFailures++;
         
-        // Send error to server
-        char errMsg[128];
-        snprintf(errMsg, sizeof(errMsg), "I2C wakeUp failed: %s (consecutive: %lu)", 
-                 errorMessage, consecutiveI2CFailures);
-        sendEvent(EVENT_ERROR, errMsg);
-        
-        // Attempt recovery after multiple failures
         if (consecutiveI2CFailures >= 3) {
-            sendEvent(EVENT_WARNING, "Attempting I2C bus recovery");
+            sendEvent(EVENT_WARNING, "Attempting I2C recovery");
             if (recoverI2C()) {
                 sendEvent(EVENT_INFO, "I2C recovery successful");
                 consecutiveI2CFailures = 0;
             } else {
-                sendEvent(EVENT_CRITICAL, "I2C recovery failed - check wiring");
+                sendEvent(EVENT_CRITICAL, "I2C recovery failed");
             }
         }
-        
-        delay(MEASUREMENT_INTERVAL_MS);
         return;
     }
     
-    // Single shot measurement - no need to discard first reading
-    // (Datasheet v1.6 removed this recommendation)
-    // Takes ~5 seconds to complete
-    error = sensor.measureAndReadSingleShot(co2, temp, humidity);
-    if (error != NO_ERROR) {
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.print("measureAndReadSingleShot error: ");
-        Serial.println(errorMessage);
-        
+    if (!dataReady) {
+        Serial.println("Data not ready (unexpected at 60s interval)");
+        return;
+    }
+    
+    error = sensor.readMeasurement(co2, temp, humidity);
+    
+    if (error != 0) {
+        Serial.print("readMeasurement error: ");
+        Serial.println(error);
         totalI2CErrors++;
         consecutiveI2CFailures++;
-        consecutiveFailures++;
         
-        // Send error to server
-        char errMsg[128];
-        snprintf(errMsg, sizeof(errMsg), "I2C measurement failed: %s (consecutive: %lu)", 
-                 errorMessage, consecutiveI2CFailures);
+        char errMsg[64];
+        snprintf(errMsg, sizeof(errMsg), "Read failed, error: %d", error);
         sendEvent(EVENT_ERROR, errMsg);
         
-        // Attempt recovery after multiple failures
         if (consecutiveI2CFailures >= 3) {
-            sendEvent(EVENT_WARNING, "Attempting I2C bus recovery after measurement failure");
+            sendEvent(EVENT_WARNING, "Attempting I2C recovery");
             if (recoverI2C()) {
                 sendEvent(EVENT_INFO, "I2C recovery successful");
                 consecutiveI2CFailures = 0;
             } else {
-                sendEvent(EVENT_CRITICAL, "I2C recovery failed - sensor may be disconnected");
+                sendEvent(EVENT_CRITICAL, "I2C recovery failed");
             }
         }
-        
-        sensor.powerDown();  // Still try to power down
-        delay(MEASUREMENT_INTERVAL_MS);
         return;
     }
     
-    // Reset I2C failure counter on successful measurement
-    if (consecutiveI2CFailures > 0) {
-        char recoverMsg[64];
-        snprintf(recoverMsg, sizeof(recoverMsg), "I2C recovered after %lu consecutive failures", 
-                 consecutiveI2CFailures);
-        sendEvent(EVENT_INFO, recoverMsg);
-        consecutiveI2CFailures = 0;
-    }
-    
-    // Power down sensor immediately after reading to save power
-    // (Datasheet Section 3.11 recommends this for single-shot mode)
-    error = sensor.powerDown();
-    if (error != NO_ERROR) {
-        errorToString(error, errorMessage, sizeof errorMessage);
-        Serial.print("powerDown error: ");
-        Serial.println(errorMessage);
-        // Non-fatal, continue anyway
-    }
-    
+    // Successful read
+    consecutiveI2CFailures = 0;
     totalMeasurements++;
     
-    // Sanity check readings
+    // Sanity check
     if (co2 < 300 || co2 > 10000) {
-        char warnMsg[64];
-        snprintf(warnMsg, sizeof(warnMsg), "Unusual CO2 reading: %d ppm", co2);
+        char warnMsg[48];
+        snprintf(warnMsg, sizeof(warnMsg), "Unusual CO2: %d ppm", co2);
         sendEvent(EVENT_WARNING, warnMsg);
     }
     
-    // Print locally
-    Serial.println("=== Reading ===");
-    Serial.printf("CO2: %d ppm | Temp: %.1f C | Humidity: %.1f %%\n", co2, temp, humidity);
-
-    // Store reading in buffer instead of sending immediately
-    if (bufferCount < MAX_BUFFER_SIZE) {
-        readingBuffer[bufferCount].co2 = co2;
-        readingBuffer[bufferCount].temp = temp;
-        readingBuffer[bufferCount].humidity = humidity;
-        getISOTimestamp(readingBuffer[bufferCount].timestamp, 25);
-        bufferCount++;
-        Serial.printf("Buffered reading %d/%d\n", bufferCount, MAX_BUFFER_SIZE);
+    // Print reading
+    Serial.print("CO2: ");
+    Serial.print(co2);
+    Serial.print(" ppm | Temp: ");
+    Serial.print(temp, 1);
+    Serial.print(" C | Humidity: ");
+    Serial.print(humidity, 1);
+    Serial.println(" %");
+    
+    // Send to API
+    if (sendReading(co2, temp, humidity)) {
+        successfulUploads++;
+        consecutiveUploadFailures = 0;
+        flashLED(1);
     } else {
-        Serial.println("Buffer full, dropping reading");
-    }
-
-    // Check if time to send batch
-    unsigned long now = millis();
-    bool shouldSend = (now - lastBatchSentMs >= BATCH_INTERVAL_MS) ||
-                      (bufferCount >= MAX_BUFFER_SIZE - 2);  // Force if buffer nearly full
-
-    if (shouldSend && bufferCount > 0) {
-        int sentCount = bufferCount;  // Save before sendBatch clears it
-        if (sendBatch()) {
-            successfulUploads += sentCount;
-            lastBatchSentMs = now;
-            consecutiveFailures = 0;
-            flashLED(2);  // Double flash = batch sent
-        } else {
-            consecutiveFailures++;
-            flashLED(3);  // Triple flash = failed
+        consecutiveUploadFailures++;
+        flashLED(3);
+        
+        if (consecutiveUploadFailures >= 5) {
+            char errMsg[48];
+            snprintf(errMsg, sizeof(errMsg), "%lu consecutive upload failures", 
+                     consecutiveUploadFailures);
+            sendEvent(EVENT_ERROR, errMsg);
         }
     }
-
-    // Print diagnostics every 100 measurements
+    
+    // Periodic diagnostics and health report
     if (totalMeasurements % 100 == 0) {
         printDiagnostics();
         
-        // Send periodic health report
         char healthMsg[128];
-        snprintf(healthMsg, sizeof(healthMsg), 
-                 "Health: %lu measurements, %.1f%% success, %lu I2C errors", 
-                 totalMeasurements, 
-                 (100.0 * successfulUploads / totalMeasurements),
-                 totalI2CErrors);
+        snprintf(healthMsg, sizeof(healthMsg),
+                 "Health: %lu measurements, %.1f%% success, %lu I2C errors, %lu WiFi reconnects",
+                 totalMeasurements,
+                 totalMeasurements > 0 ? (100.0 * successfulUploads / totalMeasurements) : 0.0,
+                 totalI2CErrors,
+                 totalWiFiReconnects);
         sendEvent(EVENT_INFO, healthMsg);
-    }
-    
-    // Alert if too many consecutive failures
-    if (consecutiveFailures >= 10) {
-        Serial.println("WARNING: 10+ consecutive failures!");
-        sendEvent(EVENT_CRITICAL, "10+ consecutive upload failures");
-        
-        // Long flash pattern to indicate serious problem
-        for (int i = 0; i < 5; i++) {
-            flashLED(1, 500);
-            delay(200);
-        }
-    }
-    
-    // Calculate remaining wait time
-    // measureAndReadSingleShot takes ~5 seconds, so subtract that
-    unsigned long waitTime = MEASUREMENT_INTERVAL_MS > 5000 ?
-                             MEASUREMENT_INTERVAL_MS - 5000 : 0;
-
-    Serial.printf("Waiting %lu ms (hold BOOT to calibrate)...\n\n", waitTime);
-
-    // Non-blocking wait that checks for FRC button
-    unsigned long waitStart = millis();
-    while (millis() - waitStart < waitTime) {
-        // Check for calibration button during wait
-        if (frcCheckButton(sensor, [](int type, const char* msg) {
-            return sendEvent((EventType)type, msg);
-        })) {
-            return;  // FRC ran, restart loop
-        }
-        delay(100);  // Check every 100ms
     }
 }
