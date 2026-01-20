@@ -56,7 +56,7 @@ const uint16_t SENSOR_ALTITUDE_METERS = 15;
 // Temperature offset compensation for self-heating
 // Default is 4.0°C - calibrate against a reference thermometer and adjust
 // Formula: offset = T_sensor - T_reference + current_offset
-const float TEMPERATURE_OFFSET_C = 5.3;
+const float TEMPERATURE_OFFSET_C = 3.6;
 
 // WiFi connection
 const unsigned long WIFI_RETRY_DELAY_MS = 500;
