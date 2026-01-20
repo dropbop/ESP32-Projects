@@ -20,6 +20,7 @@
 
 #include <Arduino.h>
 #include <SensirionI2cScd4x.h>
+#include <esp_task_wdt.h>
 
 // ===========================================
 // Configuration
@@ -123,18 +124,21 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
     
     while (digitalRead(FRC_BUTTON_PIN) == LOW) {
         unsigned long held = millis() - pressStart;
-        
+
+        // Keep watchdog happy during button hold
+        esp_task_wdt_reset();
+
         // Progress dots
         if (held / 500 > dots) {
             Serial.print(".");
             dots++;
         }
-        
+
         if (held >= FRC_HOLD_TIME_MS) {
             Serial.println(" GO!");
             break;
         }
-        
+
         delay(50);
     }
     
@@ -196,7 +200,10 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
     while (millis() - warmupStart < FRC_WARMUP_DURATION_MS) {
         unsigned long elapsed = millis() - warmupStart;
         unsigned long remaining = FRC_WARMUP_DURATION_MS - elapsed;
-        
+
+        // Keep watchdog happy during 5-minute warmup
+        esp_task_wdt_reset();
+
         // Single-shot measurement
         uint16_t co2 = 0;
         float temp = 0, humidity = 0;
@@ -237,6 +244,7 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
         // Wait for next reading interval
         unsigned long nextReading = warmupStart + ((readingCount + 1) * FRC_WARMUP_INTERVAL_MS);
         while (millis() < nextReading && millis() - warmupStart < FRC_WARMUP_DURATION_MS) {
+            esp_task_wdt_reset();
             delay(100);
         }
     }
@@ -326,6 +334,7 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
     // Wait for button release
     Serial.println("[FRC] Release button to continue...");
     while (digitalRead(FRC_BUTTON_PIN) == LOW) {
+        esp_task_wdt_reset();
         delay(50);
     }
     delay(200);  // Debounce

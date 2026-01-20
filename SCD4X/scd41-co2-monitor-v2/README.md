@@ -4,10 +4,10 @@ ESP32-based CO2/temperature/humidity monitor using the Sensirion SCD41 sensor. S
 
 ## Features
 
-- **Periodic measurement mode** with Automatic Self-Calibration (ASC) enabled
+- **Periodic measurement mode** with ASC disabled (uses manual FRC calibration)
 - **60-second measurement interval** - matches sensor response time
 - **Altitude compensation** - configured for Houston, TX (15m)
-- **Temperature offset compensation** - adjustable for your enclosure
+- **Temperature offset compensation** - currently set to 3.6°C
 - **Forced recalibration (FRC)** via BOOT button for manual calibration
 - **I2C bus recovery** - automatic recovery from stuck I2C transactions
 - **Watchdog timer** - automatic ESP32 reset if code hangs
@@ -58,15 +58,13 @@ Built-in LED on GPIO 2 provides status feedback.
 
 ### Automatic Self-Calibration (ASC)
 
-ASC is **enabled by default** and maintains long-term accuracy automatically. Requirements:
+ASC is **disabled** in this build. The sensor relies on manual Forced Recalibration (FRC) instead. This gives you direct control over when and how calibration happens, rather than relying on the sensor's algorithm to detect "clean air" conditions.
 
-- Sensor must see fresh outdoor air (~420-440 ppm) for **at least 3 minutes**
-- This must happen **at least once per week**
-- Works automatically - just take the sensor outside occasionally
+If you prefer automatic calibration, you can enable ASC by changing line ~428 in the .ino file to `sensor.setAutomaticSelfCalibrationEnabled(true)`. ASC requires the sensor to see fresh outdoor air (~420-440 ppm) for at least 3 minutes, at least once per week.
 
 ### Forced Recalibration (FRC)
 
-For manual calibration when ASC isn't sufficient:
+The primary calibration method:
 
 1. Take sensor outside to fresh air (away from roads/HVAC exhaust)
 2. Power on and wait for WiFi connection
@@ -81,7 +79,7 @@ The reference CO2 is set to **440 ppm** (appropriate for Houston urban area). Ad
 
 ### Temperature Offset
 
-The sensor generates heat during operation. Default offset is 4.0°C. To calibrate:
+The sensor generates heat during operation. Current offset is 3.6°C. To calibrate:
 
 1. Let sensor run for 30+ minutes to reach thermal equilibrium
 2. Compare sensor temperature to a reference thermometer
@@ -162,11 +160,13 @@ Event types: `info`, `warning`, `error`, `critical`
 
 This code uses **periodic measurement mode** (not single-shot with power-down) because:
 
-1. **ASC works** - Automatic Self-Calibration requires continuous operation
+1. **FRC requires it** - Forced Recalibration needs the sensor to be warmed up and measuring
 2. **Simpler code** - No wake/sleep dance needed
 3. **Consistent timing** - Sensor updates every 5 seconds internally
 
 Trade-off: ~15mA average current vs ~0.5mA with single-shot. For mains-powered applications, this doesn't matter.
+
+Note: If you enable ASC, periodic mode is required for it to function.
 
 ### Measurement Timing
 
