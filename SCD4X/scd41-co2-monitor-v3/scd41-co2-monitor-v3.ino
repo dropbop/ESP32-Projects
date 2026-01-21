@@ -303,6 +303,31 @@ void displayConnecting(int attempt, int maxAttempts) {
     u8g2.sendBuffer();
 }
 
+void displayWaitingCountdown(unsigned long remainingMs) {
+    u8g2.clearBuffer();
+
+    // Title
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(22, 18, "Waiting for");
+    u8g2.drawStr(18, 32, "first reading");
+
+    // Progress bar
+    unsigned long elapsed = MEASUREMENT_INTERVAL_MS - remainingMs;
+    int progress = (elapsed * 100) / MEASUREMENT_INTERVAL_MS;
+    u8g2.drawFrame(14, 42, 100, 8);
+    u8g2.drawBox(15, 43, (progress * 98) / 100, 6);
+
+    // Time remaining (M:SS format)
+    u8g2.setFont(u8g2_font_6x10_tr);
+    char buf[16];
+    unsigned long secs = remainingMs / 1000;
+    snprintf(buf, sizeof(buf), "%lu:%02lu left", secs / 60, secs % 60);
+    int w = u8g2.getStrWidth(buf);
+    u8g2.drawStr((128 - w) / 2, 58, buf);
+
+    u8g2.sendBuffer();
+}
+
 // ===========================================
 // LED feedback
 // ===========================================
@@ -359,6 +384,47 @@ bool sendEvent(EventType type, const char* message) {
 // Wrapper for FRC module callback
 bool frcEventCallback(int type, const char* msg) {
     return sendEvent((EventType)type, msg);
+}
+
+// FRC display callback - shows calibration progress on OLED
+void frcDisplayUpdate(unsigned long remainingMs, unsigned long totalMs,
+                      int readingCount, uint16_t currentCO2, float avgCO2) {
+    u8g2.clearBuffer();
+
+    // Title
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(8, 14, "CALIBRATING...");
+
+    // Current CO2 reading
+    u8g2.setFont(u8g2_font_6x10_tr);
+    char buf[24];
+    if (currentCO2 > 0) {
+        snprintf(buf, sizeof(buf), "CO2: %d ppm", currentCO2);
+    } else {
+        strcpy(buf, "CO2: ---");
+    }
+    u8g2.drawStr(20, 28, buf);
+
+    // Average
+    if (readingCount > 0) {
+        snprintf(buf, sizeof(buf), "Avg: %d ppm", (int)avgCO2);
+    } else {
+        strcpy(buf, "Avg: ---");
+    }
+    u8g2.drawStr(20, 40, buf);
+
+    // Progress bar
+    int progress = ((totalMs - remainingMs) * 100) / totalMs;
+    u8g2.drawFrame(14, 46, 100, 8);
+    u8g2.drawBox(15, 47, (progress * 98) / 100, 6);
+
+    // Time remaining (MM:SS format)
+    unsigned long secs = remainingMs / 1000;
+    snprintf(buf, sizeof(buf), "%lu:%02lu left", secs / 60, secs % 60);
+    int w = u8g2.getStrWidth(buf);
+    u8g2.drawStr((128 - w) / 2, 62, buf);
+
+    u8g2.sendBuffer();
 }
 
 // ===========================================
@@ -763,8 +829,8 @@ void setup() {
     lastMeasurementTime = millis();
     lastDisplayUpdate = millis();
 
-    // Show waiting for first reading
-    displayMessage("Waiting for", "first reading...");
+    // Show waiting countdown for first reading
+    displayWaitingCountdown(MEASUREMENT_INTERVAL_MS);
     Serial.println();
     Serial.println("Ready. First reading in 60 seconds.");
     Serial.println();
@@ -798,13 +864,19 @@ void loop() {
     // Update display periodically (for clock, WiFi status, etc.)
     if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL_MS) {
         lastDisplayUpdate = now;
-        if (!displayWaiting) {
+        if (displayWaiting) {
+            // Show countdown during waiting phase
+            unsigned long elapsed = now - lastMeasurementTime;
+            unsigned long remaining = elapsed < MEASUREMENT_INTERVAL_MS ?
+                                      MEASUREMENT_INTERVAL_MS - elapsed : 0;
+            displayWaitingCountdown(remaining);
+        } else {
             updateDisplay();
         }
     }
 
     // Check for FRC button press
-    if (frcCheckButton(sensor, frcEventCallback)) {
+    if (frcCheckButton(sensor, frcEventCallback, frcDisplayUpdate)) {
         // FRC was performed, restart periodic measurement
         sensor.startPeriodicMeasurement();
         lastMeasurementTime = millis();

@@ -87,6 +87,16 @@ enum FRCEventType {
 
 typedef bool (*FRCEventCallback)(int eventType, const char* message);
 
+// Display callback for FRC progress updates
+// Called at start, after each reading, and every second during wait intervals
+typedef void (*FRCDisplayCallback)(
+    unsigned long remainingMs,    // Time remaining in warmup
+    unsigned long totalMs,        // Total warmup duration (FRC_WARMUP_DURATION_MS)
+    int readingCount,             // Number of readings taken so far
+    uint16_t currentCO2,          // Latest CO2 reading (0 if no reading yet)
+    float avgCO2                  // Running average CO2
+);
+
 // ===========================================
 // Initialize - call in setup()
 // ===========================================
@@ -108,7 +118,8 @@ void frcInit() {
 // periodic measurement with sensor.startPeriodicMeasurement()
 // ===========================================
 
-bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullptr) {
+bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullptr,
+                    FRCDisplayCallback displayUpdate = nullptr) {
     if (!_frcInitialized) return false;
     
     // Check if button is pressed (active low)
@@ -173,7 +184,12 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
                  FRC_WARMUP_DURATION_MS / 60000, FRC_REFERENCE_PPM);
         logEvent(FRC_EVENT_INFO, msg);
     }
-    
+
+    // Initial display update
+    if (displayUpdate) {
+        displayUpdate(FRC_WARMUP_DURATION_MS, FRC_WARMUP_DURATION_MS, 0, 0, 0);
+    }
+
     // ========================================
     // STOP PERIODIC MEASUREMENT
     // ========================================
@@ -235,16 +251,35 @@ bool frcCheckButton(SensirionI2cScd4x &sensor, FRCEventCallback logEvent = nullp
                     Serial.print(") | ");
                     Serial.print(remaining / 1000);
                     Serial.println("s remaining");
-                    
+
+                    // Update display after reading
+                    if (displayUpdate) {
+                        displayUpdate(remaining, FRC_WARMUP_DURATION_MS, readingCount, co2, avgCO2);
+                    }
+
                     _frcFlashLED(1, 100, 0);
                 }
             }
         }
-        
-        // Wait for next reading interval
+
+        // Wait for next reading interval, updating display every second
         unsigned long nextReading = warmupStart + ((readingCount + 1) * FRC_WARMUP_INTERVAL_MS);
+        unsigned long lastDisplayUpdate = millis();
+        uint16_t lastCO2 = 0;  // Preserve last CO2 for display during wait
+
+        // Get the CO2 value we just read (if any) for display during wait
+        // Note: co2 variable is still in scope from above
+
         while (millis() < nextReading && millis() - warmupStart < FRC_WARMUP_DURATION_MS) {
             esp_task_wdt_reset();
+
+            // Update display every second for countdown
+            if (displayUpdate && millis() - lastDisplayUpdate >= 1000) {
+                lastDisplayUpdate = millis();
+                unsigned long currentRemaining = FRC_WARMUP_DURATION_MS - (millis() - warmupStart);
+                displayUpdate(currentRemaining, FRC_WARMUP_DURATION_MS, readingCount, co2, avgCO2);
+            }
+
             delay(100);
         }
     }
