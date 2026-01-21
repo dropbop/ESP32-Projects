@@ -1,20 +1,24 @@
 /*
- * SCD41 CO2 Monitor + IR Blaster
+ * SCD41 CO2 Monitor v3 - OLED + IR Blaster
  *
- * Combines SCD41 environmental monitoring with IR remote control.
- * Uses the same SCD41 handling as scd41-co2-monitor-v2.
+ * Combines SCD41 environmental monitoring, OLED display, and IR remote control.
+ * Uses periodic measurement mode with 60-second readings sent to local Flask API.
  *
  * Hardware:
  *   - ESP32 Dev Module
  *   - Sensirion SCD41 CO2 sensor (I2C)
+ *   - Inland 1.3" 128x64 OLED (SH1106, SPI) - mounted upside-down
  *   - IR LED on GPIO 4
  *
  * Wiring:
- *   SCD41 SDA  -> GPIO 21
- *   SCD41 SCL  -> GPIO 22
- *   SCD41 VDD  -> 3V3
- *   SCD41 GND  -> GND
- *   IR LED     -> GPIO 4 (through 100 ohm resistor)
+ *   SCD41 (I2C):           OLED (SPI):              IR LED:
+ *   VDD  -> 3V3            VCC  -> VIN (5V)         Anode  -> 100ohm -> GPIO 4
+ *   GND  -> GND            GND  -> GND              Cathode -> GND
+ *   SDA  -> GPIO 21        CLK  -> GPIO 25
+ *   SCL  -> GPIO 22        MOSI -> GPIO 26
+ *                          RES  -> GPIO 12
+ *                          DC   -> GPIO 14
+ *                          CS   -> GPIO 27
  *
  * Serial Commands (for IR control):
  *   on      - Send AC ON signal once
@@ -35,6 +39,7 @@
 #include <HTTPClient.h>
 #include <SensirionI2cScd4x.h>
 #include <Wire.h>
+#include <U8g2lib.h>
 #include <esp_task_wdt.h>
 #include <IRremoteESP8266.h>
 #include <IRsend.h>
@@ -62,12 +67,9 @@ bool sendEvent(EventType type, const char* message);
 const unsigned long MEASUREMENT_INTERVAL_MS = 60000;
 
 // Altitude compensation - Houston, TX is ~15m above sea level
-// Adjust if you move the sensor to a different elevation
 const uint16_t SENSOR_ALTITUDE_METERS = 15;
 
 // Temperature offset compensation for self-heating
-// Default is 4.0C - calibrate against a reference thermometer and adjust
-// Formula: offset = T_sensor - T_reference + current_offset
 const float TEMPERATURE_OFFSET_C = 3.6;
 
 // WiFi connection
@@ -80,14 +82,34 @@ const int WATCHDOG_TIMEOUT_SECONDS = 120;
 // IR spam interval
 const unsigned long IR_SPAM_INTERVAL_MS = 250;
 
+// Display update interval (update more frequently than measurements for responsiveness)
+const unsigned long DISPLAY_UPDATE_INTERVAL_MS = 1000;
+
 // ===========================================
-// Hardware
+// Hardware Pin Definitions
 // ===========================================
 
 #define LED_PIN 2
+
+// I2C for SCD41
 #define I2C_SDA 21
 #define I2C_SCL 22
+
+// SPI for OLED
+#define OLED_CLK  25
+#define OLED_MOSI 26
+#define OLED_CS   27
+#define OLED_DC   14
+#define OLED_RES  12
+
+// IR LED
 #define IR_LED_PIN 4
+
+// ===========================================
+// OLED Display (Software SPI, rotated 180° for upside-down mounting)
+// ===========================================
+
+U8G2_SH1106_128X64_NONAME_F_4W_SW_SPI u8g2(U8G2_R2, OLED_CLK, OLED_MOSI, OLED_CS, OLED_DC, OLED_RES);
 
 // ===========================================
 // IR Signal Data (Whynter AC - from Flipper Zero capture)
@@ -149,6 +171,14 @@ const uint16_t AC_OFF_RAW_LEN = sizeof(AC_OFF_RAW) / sizeof(AC_OFF_RAW[0]);
 SensirionI2cScd4x sensor;
 IRsend irsend(IR_LED_PIN);
 
+// Display state
+static uint16_t displayCO2 = 0;
+static float displayTemp = 0.0;
+static float displayHumidity = 0.0;
+static bool displayError = false;
+static bool displayWaiting = true;
+static unsigned long lastDisplayUpdate = 0;
+
 // IR state
 static bool irSpamming = false;
 static bool irSpamOn = true;  // true = spam ON signal, false = spam OFF signal
@@ -164,6 +194,114 @@ static uint32_t consecutiveUploadFailures = 0;
 
 // Timing
 static unsigned long lastMeasurementTime = 0;
+
+// ===========================================
+// Display Functions
+// ===========================================
+
+void updateDisplay() {
+    u8g2.clearBuffer();
+
+    // CO2 reading - big and centered
+    u8g2.setFont(u8g2_font_logisoso28_tn);  // Large numeric font
+    char co2Str[8];
+
+    if (displayError) {
+        strcpy(co2Str, "ERR");
+        u8g2.setFont(u8g2_font_ncenB14_tr);
+    } else if (displayWaiting || displayCO2 == 0) {
+        strcpy(co2Str, "---");
+    } else {
+        snprintf(co2Str, sizeof(co2Str), "%d", displayCO2);
+    }
+
+    // Center the CO2 value
+    int width = u8g2.getStrWidth(co2Str);
+    u8g2.drawStr((128 - width) / 2 - 15, 32, co2Str);
+
+    // "ppm" label
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(90, 32, "ppm");
+
+    // Temp and humidity on same line
+    u8g2.setFont(u8g2_font_6x10_tr);
+    char envStr[32];
+    if (!displayWaiting && displayCO2 > 0) {
+        snprintf(envStr, sizeof(envStr), "%.1fC  %.0f%%", displayTemp, displayHumidity);
+    } else {
+        strcpy(envStr, "--.-C  --%");
+    }
+    width = u8g2.getStrWidth(envStr);
+    u8g2.drawStr((128 - width) / 2, 45, envStr);
+
+    // Divider line
+    u8g2.drawHLine(0, 50, 128);
+
+    // Status bar at bottom
+    u8g2.setFont(u8g2_font_5x7_tr);
+
+    // WiFi indicator
+    if (WiFi.status() == WL_CONNECTED) {
+        int rssi = WiFi.RSSI();
+        char wifiStr[12];
+        snprintf(wifiStr, sizeof(wifiStr), "WiFi %d", rssi);
+        u8g2.drawStr(0, 62, wifiStr);
+    } else {
+        u8g2.drawStr(0, 62, "No WiFi");
+    }
+
+    // IR status (if spamming)
+    if (irSpamming) {
+        u8g2.drawStr(50, 62, irSpamOn ? "IR:ON" : "IR:OFF");
+    }
+
+    // Uptime
+    char uptimeStr[12];
+    unsigned long mins = millis() / 60000;
+    if (mins < 60) {
+        snprintf(uptimeStr, sizeof(uptimeStr), "%lum", mins);
+    } else {
+        snprintf(uptimeStr, sizeof(uptimeStr), "%luh%lum", mins / 60, mins % 60);
+    }
+    u8g2.drawStr(100, 62, uptimeStr);
+
+    u8g2.sendBuffer();
+}
+
+void displayMessage(const char* line1, const char* line2 = nullptr) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+
+    int y = line2 ? 25 : 35;
+    int w = u8g2.getStrWidth(line1);
+    u8g2.drawStr((128 - w) / 2, y, line1);
+
+    if (line2) {
+        w = u8g2.getStrWidth(line2);
+        u8g2.drawStr((128 - w) / 2, 45, line2);
+    }
+
+    u8g2.sendBuffer();
+}
+
+void displayConnecting(int attempt, int maxAttempts) {
+    u8g2.clearBuffer();
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.drawStr(20, 25, "Connecting...");
+
+    // Progress bar
+    u8g2.drawFrame(14, 35, 100, 12);
+    int progress = (attempt * 100) / maxAttempts;
+    u8g2.drawBox(15, 36, progress, 10);
+
+    u8g2.setFont(u8g2_font_5x7_tr);
+    char buf[20];
+    snprintf(buf, sizeof(buf), "Attempt %d/%d", attempt, maxAttempts);
+    int w = u8g2.getStrWidth(buf);
+    u8g2.drawStr((128 - w) / 2, 58, buf);
+
+    u8g2.sendBuffer();
+}
 
 // ===========================================
 // LED feedback
@@ -236,6 +374,7 @@ void connectWiFi() {
         delay(WIFI_RETRY_DELAY_MS);
         Serial.print(".");
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+        displayConnecting(attempts + 1, WIFI_MAX_ATTEMPTS);
         attempts++;
     }
     digitalWrite(LED_PIN, LOW);
@@ -244,9 +383,13 @@ void connectWiFi() {
         Serial.println();
         Serial.print("Connected! IP: ");
         Serial.println(WiFi.localIP());
+        displayMessage("WiFi Connected!", WiFi.localIP().toString().c_str());
+        delay(1000);
     } else {
         Serial.println();
         Serial.println("WiFi connection failed!");
+        displayMessage("WiFi Failed!", "Continuing offline");
+        delay(2000);
         flashLED(10, 50);
     }
 }
@@ -314,6 +457,7 @@ bool sendReading(uint16_t co2, float temp, float humidity) {
 
 bool recoverI2C() {
     Serial.println("Attempting I2C recovery...");
+    displayMessage("I2C Error", "Recovering...");
 
     // End I2C
     Wire.end();
@@ -352,6 +496,8 @@ bool recoverI2C() {
 
     if (error == 0) {
         Serial.println("I2C recovery successful");
+        displayMessage("I2C Recovered!");
+        delay(1000);
 
         // Restart periodic measurement
         sensor.stopPeriodicMeasurement();
@@ -362,6 +508,8 @@ bool recoverI2C() {
     }
 
     Serial.println("I2C recovery failed");
+    displayMessage("I2C Failed!", "Check wiring");
+    delay(2000);
     return false;
 }
 
@@ -507,26 +655,35 @@ void setup() {
     pinMode(LED_PIN, OUTPUT);
     digitalWrite(LED_PIN, LOW);
 
-    // Initialize IR
-    irsend.begin();
+    // Initialize OLED first for visual feedback
+    Serial.println("Initializing OLED...");
+    u8g2.begin();
+    displayMessage("CO2 Monitor v3", "Starting...");
+    delay(500);
 
     Serial.println();
     Serial.println("========================================");
-    Serial.print("SCD41 CO2 Monitor + IR Blaster - ");
+    Serial.print("SCD41 CO2 Monitor v3 - ");
     Serial.println(deviceName);
     Serial.print("Endpoint: ");
     Serial.println(apiEndpoint);
     Serial.println("Mode: Periodic (ASC disabled, FRC enabled)");
+    Serial.println("Features: OLED + IR Blaster");
     Serial.println("========================================");
     Serial.println();
     Serial.println("IR commands: on, off, spamon, spamoff, stop, help");
     Serial.println("Hold BOOT button 3 seconds to calibrate");
     Serial.println();
 
-    // Connect to WiFi
+    // Initialize IR
+    irsend.begin();
+
+    // Connect WiFi
+    displayMessage("Connecting WiFi...");
     connectWiFi();
 
     // Initialize I2C and sensor
+    displayMessage("Init sensor...");
     Wire.begin(I2C_SDA, I2C_SCL);
     sensor.begin(Wire, SCD41_I2C_ADDR_62);
     delay(30);
@@ -549,7 +706,7 @@ void setup() {
         Serial.println(" m");
     }
 
-    // Set temperature offset (library takes degrees directly)
+    // Set temperature offset
     error = sensor.setTemperatureOffset(TEMPERATURE_OFFSET_C);
     if (error != 0) {
         Serial.print("setTemperatureOffset error: ");
@@ -565,11 +722,16 @@ void setup() {
     error = sensor.getSerialNumber(serialNumber);
     if (error != 0) {
         Serial.println("ERROR: SCD41 not found! Check wiring.");
+        displayMessage("Sensor Error!", "Check wiring");
         sendEvent(EVENT_CRITICAL, "SCD41 sensor not found at startup");
+        displayError = true;
     } else {
         Serial.print("SCD41 serial: 0x");
         Serial.print((uint32_t)(serialNumber >> 32), HEX);
         Serial.println((uint32_t)(serialNumber & 0xFFFFFFFF), HEX);
+
+        displayMessage("Sensor ready!");
+        delay(1000);
 
         char startupMsg[80];
         snprintf(startupMsg, sizeof(startupMsg),
@@ -581,7 +743,6 @@ void setup() {
     }
 
     // Start periodic measurement mode
-    // Sensor updates every 5 seconds internally
     error = sensor.startPeriodicMeasurement();
     if (error != 0) {
         Serial.print("startPeriodicMeasurement error: ");
@@ -591,7 +752,7 @@ void setup() {
         Serial.println("Periodic measurement started");
     }
 
-    // Disable ASC - relying on manual FRC calibration instead
+    // Disable ASC - relying on manual FRC calibration
     sensor.setAutomaticSelfCalibrationEnabled(false);
     Serial.println("ASC disabled (using manual FRC calibration)");
 
@@ -600,7 +761,10 @@ void setup() {
 
     // Set initial timing
     lastMeasurementTime = millis();
+    lastDisplayUpdate = millis();
 
+    // Show waiting for first reading
+    displayMessage("Waiting for", "first reading...");
     Serial.println();
     Serial.println("Ready. First reading in 60 seconds.");
     Serial.println();
@@ -614,11 +778,12 @@ void loop() {
     // Reset watchdog
     esp_task_wdt_reset();
 
+    unsigned long now = millis();
+
     // Handle serial commands (IR control)
     handleSerialCommands();
 
     // Handle IR spam mode
-    unsigned long now = millis();
     if (irSpamming && (now - lastIrSpam >= IR_SPAM_INTERVAL_MS)) {
         lastIrSpam = now;
         if (irSpamOn) {
@@ -630,17 +795,27 @@ void loop() {
         }
     }
 
+    // Update display periodically (for clock, WiFi status, etc.)
+    if (now - lastDisplayUpdate >= DISPLAY_UPDATE_INTERVAL_MS) {
+        lastDisplayUpdate = now;
+        if (!displayWaiting) {
+            updateDisplay();
+        }
+    }
+
     // Check for FRC button press
     if (frcCheckButton(sensor, frcEventCallback)) {
         // FRC was performed, restart periodic measurement
         sensor.startPeriodicMeasurement();
         lastMeasurementTime = millis();
+        displayMessage("Calibration", "Complete!");
+        delay(2000);
         return;
     }
 
     // Check if it's time for a measurement
     if (now - lastMeasurementTime < MEASUREMENT_INTERVAL_MS) {
-        delay(100);
+        delay(50);
         return;
     }
     lastMeasurementTime = now;
@@ -658,12 +833,15 @@ void loop() {
         Serial.println(error);
         totalI2CErrors++;
         consecutiveI2CFailures++;
+        displayError = true;
+        updateDisplay();
 
         if (consecutiveI2CFailures >= 3) {
             sendEvent(EVENT_WARNING, "Attempting I2C recovery");
             if (recoverI2C()) {
                 sendEvent(EVENT_INFO, "I2C recovery successful");
                 consecutiveI2CFailures = 0;
+                displayError = false;
             } else {
                 sendEvent(EVENT_CRITICAL, "I2C recovery failed");
             }
@@ -683,6 +861,8 @@ void loop() {
         Serial.println(error);
         totalI2CErrors++;
         consecutiveI2CFailures++;
+        displayError = true;
+        updateDisplay();
 
         char errMsg[64];
         snprintf(errMsg, sizeof(errMsg), "Read failed, error: %d", error);
@@ -693,6 +873,7 @@ void loop() {
             if (recoverI2C()) {
                 sendEvent(EVENT_INFO, "I2C recovery successful");
                 consecutiveI2CFailures = 0;
+                displayError = false;
             } else {
                 sendEvent(EVENT_CRITICAL, "I2C recovery failed");
             }
@@ -703,6 +884,14 @@ void loop() {
     // Successful read
     consecutiveI2CFailures = 0;
     totalMeasurements++;
+    displayError = false;
+    displayWaiting = false;
+
+    // Update display values
+    displayCO2 = co2;
+    displayTemp = temp;
+    displayHumidity = humidity;
+    updateDisplay();
 
     // Sanity check
     if (co2 < 300 || co2 > 10000) {
