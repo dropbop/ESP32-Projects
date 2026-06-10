@@ -365,6 +365,7 @@ bool sendEvent(EventType type, const char* message) {
     String url = String(apiEndpoint) + "/api/sensor/log";
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", String("Bearer ") + sensorApiToken);
     http.setTimeout(5000);
 
     String payload = "{\"device\":\"" + String(deviceName) +
@@ -489,6 +490,7 @@ bool sendReading(uint16_t co2, float temp, float humidity) {
     String url = String(apiEndpoint) + "/api/sensor";
     http.begin(url);
     http.addHeader("Content-Type", "application/json");
+    http.addHeader("Authorization", String("Bearer ") + sensorApiToken);
     http.setTimeout(10000);
 
     String payload = "{\"device\":\"" + String(deviceName) +
